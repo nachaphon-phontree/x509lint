@@ -30,6 +30,7 @@
 #include <stdint.h>
 #include <arpa/inet.h>
 
+#define OPENSSL_API_COMPAT 0x10100000L
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 #include <openssl/pem.h>
@@ -1153,9 +1154,10 @@ static void CheckSAN(X509 *x509, CertType type)
 	}
 }
 
-static void CheckCRL(X509 *x509)
+static bool CheckCRL(X509 *x509)
 {
 	int idx = -1;
+	bool HaveCRLHTTP = false;
 
 	do
 	{
@@ -1215,6 +1217,11 @@ static void CheckCRL(X509 *x509)
 					if (type == GEN_URI)
 					{
 						CheckValidURL(ASN1_STRING_get0_data(uri), ASN1_STRING_length(uri));
+						if (uri->length > 7 &&
+							strncmp((char *)uri->data, "http://", 7) == 0)
+						{
+							HaveCRLHTTP = true;
+						}
 					}
 					else
 					{
@@ -1270,9 +1277,11 @@ static void CheckCRL(X509 *x509)
 		sk_DIST_POINT_pop_free(crls, DIST_POINT_free);
 	}
 	while (1);
+
+	return HaveCRLHTTP;
 }
 
-static void CheckAIA(X509 *x509, CertType type)
+static bool CheckAIA(X509 *x509, CertType type)
 {
 	int idx = -1;
 	bool HaveOCSPHTTP = false;
@@ -1333,10 +1342,6 @@ static void CheckAIA(X509 *x509, CertType type)
 
 	if (type == SubscriberCertificate)
 	{
-		if (!HaveOCSPHTTP)
-		{
-			SetError(ERR_NO_OCSP_HTTP);
-		}
 		if (!HaveCertHTTP)
 		{
 			SetWarning(WARN_NO_ISSUING_CERT_HTTP);
@@ -1344,6 +1349,30 @@ static void CheckAIA(X509 *x509, CertType type)
 		if (!HaveAIA)
 		{
 			SetError(ERR_NO_AIA);
+		}
+	}
+
+	return HaveOCSPHTTP;
+}
+
+static void CheckRevocationOverHTTP(bool have_crl_http, bool have_ocsp_http, struct tm tm_before, struct tm tm_after, CertType type)
+{
+	if (!have_crl_http && !have_ocsp_http && type == SubscriberCertificate)
+	{
+		time_t not_before = mktime(&tm_before);
+		time_t not_after = mktime(&tm_after);
+		bool is_short_lived = false;
+		if (not_before >= 1773532800)		/* 2026-03-15T00:00:00Z */
+		{
+			is_short_lived = (not_after - not_before) < 604800;	/* 7 days */
+		}
+		else if (not_before >= 1710460800)	/* 2024-03-15T00:00:00Z */
+		{
+			is_short_lived = (not_after - not_before) < 864000;	/* 10 days */
+		}
+		if (!is_short_lived)
+		{
+			SetError(ERR_NO_REVOCATION_HTTP);
 		}
 	}
 }
@@ -2266,8 +2295,8 @@ void check(const unsigned char *cert_buffer, size_t cert_len, CertFormat format,
 		SetWarning(WARN_NO_CN);
 	}
 
-	CheckCRL(x509);
-	CheckAIA(x509, type);
+	CheckRevocationOverHTTP(CheckCRL(x509), CheckAIA(x509, type), tm_before, tm_after, type);
+
 	CheckPublicKey(x509, tm_after);
 
 	if ((type != SubscriberCertificate
